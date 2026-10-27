@@ -8,7 +8,7 @@ uv add "whatsapp-sdk @ git+https://github.com/Ruki111/whatsApp-sdk"
 ```
 
 ```python
-from whatsapp_sdk import WhatsApp, WhatsAppError, verify_signature
+from whatsapp_sdk import WhatsApp, WhatsAppError, verify_challenge, verify_signature
 
 wa = WhatsApp("ACCESS_TOKEN", waba_id="WABA_ID", phone_number_id="PHONE_NUMBER_ID")
 
@@ -16,35 +16,47 @@ await wa.send_text("15551234567", "Hi")
 await wa.send_template_message(to="15551234567", name="hello_world", language="en_US")
 
 try:
-    await wa.list_message_templates()
+    await wa.send_text("15551234567", "Hi")
 except WhatsAppError as error:
+    if error.retryable:      # never reached Meta, 429, 5xx, or a transient Meta code
+        ...                  # safe to send again
+    elif error.maybe_sent:   # went out, no answer: may have been delivered
+        ...                  # don't resend blindly
     print(error.status_code, error.detail)
 
-# Webhooks: check the X-Hub-Signature-256 header against the raw body.
+async for template in wa.paginate("WABA_ID/message_templates", limit=100):
+    ...
+
+# Webhooks
+verify_challenge(request.query_params, VERIFY_TOKEN)          # setup handshake
 verify_signature(APP_SECRET, raw_body, request.headers.get("X-Hub-Signature-256"))
 ```
 
 `waba_id` / `phone_number_id` are defaults; every method also takes them as arguments.
+`to` accepts a phone number or a business-scoped user ID (BSUID); `send(..., recipient_type="group")` messages a group.
 For bulk sends, pass one shared `httpx.AsyncClient` (`WhatsApp(..., client=client)`).
+Pass `app_secret=` to sign every call with `appsecret_proof`.
 Anything not wrapped: `await wa.request("GET", "<path>", params=..., json=...)`.
 
 ## Coverage
 
 | Area | Methods |
 | --- | --- |
-| Messages | `send_message` (any payload), `send_text`, `send_media`, `send_location`, `send_contacts`, `send_interactive`, `send_reaction`, `send_template_message` (incl. MM Lite), `mark_message_read` (+ typing indicator) |
-| Media | `upload_message_media`, `get_media`, `download_media`, `delete_media` |
-| Templates | `create_message_template`, `update_message_template`, `get_message_template`, `list_message_templates`, `delete_message_template`, `upload_template_sample` |
+| Messages | `send` (any type, BSUID, groups), `send_message` (raw payload), `send_text`, `send_media`, `send_location`, `send_contacts`, `send_interactive`, `send_reaction`, `send_template_message` (incl. MM Lite), `mark_message_read` (+ typing indicator) |
+| Media | `upload_message_media` (bytes or file), `get_media`, `download_media`, `delete_media` |
+| Templates | create, update, get, list, delete (bulk), `upload_template_sample`, `list_template_library`, `compare_templates`, `preview_authentication_templates`, `upsert_authentication_templates`, `migrate_message_templates`, template groups |
 | Flows | `list_flows`, `create_flow`, `get_flow` (+ metrics, preview), `update_flow`, `delete_flow`, `upload_flow_json`, `list_flow_assets`, `publish_flow`, `deprecate_flow`, `migrate_flows` |
-| Phone numbers | `list_phone_numbers`, `create_phone_number`, `get_phone_number`, `update_phone_number`, `set_two_step_pin`, `register_phone_number`, `deregister_phone_number`, `request_verification_code`, `verify_code`, `get_sending_limits`, `get_phone_settings`, `update_phone_settings` |
-| Profile & settings | `get_business_profile`, `update_business_profile`, `get/update_commerce_settings`, `get/set_encryption_key`, `get/update_compliance_info`, `get/request_official_business_account`, `set_conversational_automation` |
-| QR codes | `list_qr_codes`, `get_qr_code`, `create_qr_code`, `delete_qr_code` |
-| Blocking | `list_blocked_users`, `block_users`, `unblock_users` |
+| Phone numbers | list, create, get, update, `set_two_step_pin`, register, deregister, request/verify code, `get_sending_limits`, settings, username (+ suggestions), contact book (BSUID), `sync_business_app_data` (coexistence) |
+| Profile & settings | business profile, commerce settings, Flows encryption key, compliance info (India), Official Business Account, conversational automation (welcome, ice breakers, commands) |
+| QR codes · Blocking | `list/get/create/delete_qr_code(s)` · `list_blocked_users`, `block_users`, `unblock_users` |
 | Calling | `call` (connect, pre_accept, accept, reject, terminate, media_update), `get_call_permissions` |
-| Groups | `create_group`, `list_groups`, `get_group`, `update_group`, `delete_group`, invite links, join requests, participants |
-| WABA | `get/update_business_account`, `get_analytics` (messaging, conversation, pricing, template), `list/subscribe/unsubscribe` apps, assigned users, schedules, activities, solutions, `app_id` |
-| Partners | business portfolio, owned/client WABAs, create WABA, add phone numbers, extended credits, MM Lite onboarding, pre-verified numbers, Multi-Partner Solutions, message history events, `get_node` / `update_node` |
-| Webhooks | `verify_signature` |
+| Groups | create, list, get, update, delete, invite link (get/reset/delete), join requests, participants |
+| WABA | get/update, `get_analytics` (messaging, conversation, pricing, call, template, template group, group), subscribed apps (+ callback override), assigned users, system users, schedules, activities, solutions, product catalogs, CTWA welcome sequences, In-App Signup, customer bases, reach estimate, migrations |
+| Payments (India) | payment configurations (list/get/create/update/delete, OAuth link), `get_payment`, `refund_payment` |
+| Partners | business portfolio, owned/client WABAs, create WABA, add phone numbers, business users, extended credit lines (share/attach/revoke), MM Lite onboarding, max price agreement, partner-led business verification, pre-verified numbers, Multi-Partner Solutions, message history events |
+| Auth & tokens | `exchange_code` (Embedded Signup), `get_system_user_token`, `debug_token`, `app_id`, `appsecret_proof` |
+| Generic | `request`, `paginate`, `get_node` / `update_node` / `delete_node` |
+| Webhooks | `verify_challenge`, `verify_signature` |
 
 Reference: https://developers.facebook.com/documentation/business-messaging/whatsapp/reference/llms.txt
 

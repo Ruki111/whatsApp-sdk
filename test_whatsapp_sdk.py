@@ -5,7 +5,7 @@ import json
 
 import httpx
 
-from whatsapp_sdk import WhatsApp, WhatsAppError, verify_signature
+from whatsapp_sdk import WhatsApp, WhatsAppError, verify_challenge, verify_signature
 
 
 async def main() -> None:
@@ -65,8 +65,13 @@ async def main() -> None:
 
         await wa.get_analytics("template_analytics", start=1, end=2, granularity="DAILY",
                                template_ids=["t1"])
+        assert seen[-1].url.path == "/v99.0/w1/template_analytics"
+        assert seen[-1].url.params["template_ids"] == '["t1"]'
+
+        await wa.get_analytics("pricing_analytics", start=1, end=2, granularity="DAILY",
+                               dimensions=["COUNTRY"])
         assert seen[-1].url.params["fields"] == (
-            'template_analytics.start(1).end(2).granularity(DAILY).template_ids(["t1"])')
+            'pricing_analytics.start(1).end(2).granularity(DAILY).dimensions(["COUNTRY"])')
 
         assert await wa.download_media("m1") == b"bytes"
         assert seen[-1].headers["authorization"] == "Bearer tok"
@@ -92,6 +97,61 @@ async def main() -> None:
             assert error.status_code == 502
         else:
             raise AssertionError("missing media id did not raise")
+
+
+        # BSUIDs go in `recipient`, groups keep `to` with recipient_type=group.
+        await wa.send_text("US.13491208655302741918", "hi")
+        assert body()["recipient"] == "US.13491208655302741918" and "to" not in body()
+        await wa.send("g1", "text", {"body": "all"}, recipient_type="group")
+        assert body()["to"] == "g1" and body()["recipient_type"] == "group"
+
+        pages = iter([
+            {"data": [{"id": 1}], "paging": {"cursors": {"after": "c1"}, "next": "https://n"}},
+            {"data": [{"id": 2}], "paging": {"cursors": {"after": "c2"}}},
+        ])
+        paged = WhatsApp("tok", client=httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: seen.append(request) or httpx.Response(200, json=next(pages)))))
+        assert [item["id"] async for item in paged.paginate("w1/flows", limit=1)] == [1, 2]
+        assert seen[-1].url.params["after"] == "c1"
+
+        signed = WhatsApp("tok", client=client, app_secret="s3")
+        await signed.get_phone_number("p1")
+        proof = hmac.new(b"s3", b"tok", hashlib.sha256).hexdigest()
+        assert seen[-1].url.params["appsecret_proof"] == proof
+        await wa.get_phone_number("p1")
+        assert "appsecret_proof" not in seen[-1].url.params
+
+    # Retry classification: what a queue worker needs to decide resend vs give up.
+    def failing(exc: Exception):
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise exc
+        return WhatsApp("tok", client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+
+    async def error_of(wa: WhatsApp, method: str = "POST") -> WhatsAppError:
+        try:
+            await wa.request(method, "p1/messages")
+        except WhatsAppError as error:
+            return error
+        raise AssertionError("no error")
+
+    never_sent = await error_of(failing(httpx.ConnectError("refused")))
+    assert never_sent.retryable and not never_sent.maybe_sent
+    lost = await error_of(failing(httpx.ReadTimeout("slow")))
+    assert not lost.retryable and lost.maybe_sent
+    assert (await error_of(failing(httpx.ReadTimeout("slow")), "GET")).retryable
+
+    def status(code: int, error: dict):
+        return WhatsApp("tok", client=httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: httpx.Response(code, json={"error": error}))))
+
+    assert (await error_of(status(429, {}))).retryable
+    assert (await error_of(status(503, {}))).retryable
+    assert (await error_of(status(400, {"code": 130429}))).retryable
+    assert (await error_of(status(400, {"code": 100, "is_transient": True}))).retryable
+    assert not (await error_of(status(400, {"code": 131026}))).retryable
+
+    assert verify_challenge({"hub.mode": "subscribe", "hub.verify_token": "v", "hub.challenge": "42"}, "v") == "42"
+    assert verify_challenge({"hub.mode": "subscribe", "hub.verify_token": "x", "hub.challenge": "42"}, "v") is None
 
     signature = "sha256=" + hmac.new(b"secret", b"{}", hashlib.sha256).hexdigest()
     assert verify_signature("secret", b"{}", signature)

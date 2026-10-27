@@ -7,12 +7,21 @@ Anything not wrapped here: `await wa.request(method, path, params=..., json=...)
 import hashlib
 import hmac
 import json
+from collections.abc import AsyncIterator
+from typing import BinaryIO
 
 import httpx
 
-__all__ = ["TEMPLATE_FIELDS", "WhatsApp", "WhatsAppError", "verify_signature"]
+__all__ = [
+    "RETRYABLE_CODES", "TEMPLATE_FIELDS", "WhatsApp", "WhatsAppError",
+    "exchange_code", "verify_challenge", "verify_signature",
+]
 
 GRAPH_URL = "https://graph.facebook.com"
+
+# Meta error codes that clear up on their own (outage, rate and throughput limits, template
+# still syncing); see https://developers.facebook.com/documentation/business-messaging/whatsapp/support/error-codes
+RETRYABLE_CODES = frozenset({2, 4, 80007, 130429, 131000, 131016, 131056, 133004, 134101})
 
 # Include review details and components so sync can report rejections and detect external edits.
 TEMPLATE_FIELDS = (
@@ -22,13 +31,23 @@ TEMPLATE_FIELDS = (
 
 
 class WhatsAppError(Exception):
-    """A non-2xx response, or a 200 carrying an `error` object."""
+    """A non-2xx response, a 200 carrying an `error` object, or no response at all.
 
-    def __init__(self, status_code: int, payload: dict | None) -> None:
+    `retryable`: sending the same request again is safe and may succeed (connection never
+    made, 429, 5xx, or a transient Meta code). `maybe_sent`: the request went out but no
+    answer came back, so a message may have been delivered; don't resend it blindly."""
+
+    def __init__(self, status_code: int, payload: dict | None, *, retryable: bool | None = None,
+                 maybe_sent: bool = False) -> None:
         self.status_code = status_code
         self.payload = payload or {}
         error = self.payload.get("error", {})
         self.code = error.get("code")
+        if retryable is None:
+            retryable = (status_code == 429 or status_code >= 500
+                         or error.get("is_transient") is True or self.code in RETRYABLE_CODES)
+        self.retryable = retryable
+        self.maybe_sent = maybe_sent
         self.subcode = error.get("error_subcode")
         self.title = error.get("error_user_title")
         # error_user_msg is the human-readable one ("Variables can't be at the
@@ -47,6 +66,7 @@ class WhatsAppError(Exception):
             "title": self.title,
             "code": self.code,
             "subcode": self.subcode,
+            "retryable": self.retryable,
         }
 
 
@@ -56,8 +76,44 @@ def verify_signature(app_secret: str, body: bytes, signature_header: str | None)
     return hmac.compare_digest(expected, signature_header or "")
 
 
+def verify_challenge(params: dict, verify_token: str) -> str | None:
+    """Webhook setup handshake: the `hub.challenge` to echo back, or None to reject (403)."""
+    token = str(params.get("hub.verify_token") or "")
+    if params.get("hub.mode") == "subscribe" and hmac.compare_digest(
+        token.encode(), verify_token.encode()
+    ):
+        return str(params.get("hub.challenge") or "")
+    return None
+
+
+async def exchange_code(code: str, *, app_id: str, app_secret: str,
+                        graph_version: str = "v26.0") -> str:
+    """Embedded Signup: trade the code the popup returned for the customer's business token."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            response = await client.get(
+                f"{GRAPH_URL}/{graph_version}/oauth/access_token",
+                params={"client_id": app_id, "client_secret": app_secret, "code": code},
+            )
+        except httpx.HTTPError as exc:
+            raise _unreached(exc, "GET") from exc
+    token = _parse(response).get("access_token")
+    if not token:
+        raise _error("Meta returned no access token")
+    return token
+
+
 def _error(message: str) -> WhatsAppError:
-    return WhatsAppError(502, {"error": {"message": message}})
+    return WhatsAppError(502, {"error": {"message": message}}, retryable=False)
+
+
+def _unreached(exc: httpx.HTTPError, method: str) -> WhatsAppError:
+    message = f"Could not reach the Graph API: {exc}"
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return WhatsAppError(502, {"error": {"message": message}}, retryable=True)
+    # The request may have reached Meta: only reads are safe to repeat.
+    return WhatsAppError(502, {"error": {"message": message}}, retryable=method == "GET",
+                         maybe_sent=method != "GET")
 
 
 def _parse(response: httpx.Response) -> dict:
@@ -73,6 +129,11 @@ def _parse(response: httpx.Response) -> dict:
     return payload
 
 
+def _recipient(to: str) -> dict:
+    # BSUIDs ("US.13491208655302741918") go in `recipient`; phone numbers never contain a dot.
+    return {"recipient": to} if "." in to else {"to": to}
+
+
 def _clean(values: dict) -> dict:
     """Drop unset values: Meta rejects explicit nulls on several fields."""
     return {k: v for k, v in values.items() if v is not None}
@@ -84,6 +145,10 @@ def _query(**values) -> dict:
         k: json.dumps(v) if isinstance(v, (list, dict)) else v
         for k, v in _clean(values).items()
     }
+
+
+# Analytics served by their own WABA edge rather than as a field on the WABA.
+_ANALYTICS_EDGES = frozenset({"template_analytics", "template_group_analytics", "group_analytics"})
 
 
 def _page(fields=None, limit=None, after=None, before=None, **extra) -> dict:
@@ -106,13 +171,18 @@ class WhatsApp:
         graph_version: str = "v26.0",
         timeout: httpx.Timeout | float = 30.0,
         client: httpx.AsyncClient | None = None,
+        app_secret: str | None = None,
     ) -> None:
+        """`app_secret` signs every call with `appsecret_proof`, which Meta requires when the
+        app has "Require app secret" switched on."""
         self.access_token = access_token
         self.waba_id = waba_id
         self.phone_number_id = phone_number_id
         self.base_url = f"{GRAPH_URL}/{graph_version}"
         self.timeout = timeout
         self.client = client
+        self.appsecret_proof = hmac.new(
+            app_secret.encode(), access_token.encode(), hashlib.sha256).hexdigest() if app_secret else None
 
     async def _send(self, method: str, url: str, *, timeout=None, auth: str = "Bearer",
                     headers: dict | None = None, **kwargs) -> httpx.Response:
@@ -123,16 +193,32 @@ class WhatsApp:
         try:
             return await client.request(method, url, headers=headers, timeout=timeout, **kwargs)
         except httpx.HTTPError as exc:
-            raise _error(f"Could not reach the Graph API: {exc}") from exc
+            raise _unreached(exc, method) from exc
         finally:
             if client is not self.client:
                 await client.aclose()
 
     async def request(
-        self, method: str, path: str, *, timeout: httpx.Timeout | float | None = None, **kwargs
+        self, method: str, path: str, *, timeout: httpx.Timeout | float | None = None,
+        params: dict | None = None, **kwargs
     ) -> dict:
-        """Call any Graph API path; extra kwargs go to httpx (json, params, data, files)."""
-        return _parse(await self._send(method, f"{self.base_url}/{path}", timeout=timeout, **kwargs))
+        """Call any Graph API path; extra kwargs go to httpx (json, data, files)."""
+        if self.appsecret_proof:
+            params = {**(params or {}), "appsecret_proof": self.appsecret_proof}
+        return _parse(await self._send(method, f"{self.base_url}/{path}", timeout=timeout,
+                                       params=params, **kwargs))
+
+    async def paginate(self, path: str, **params) -> AsyncIterator[dict]:
+        """Yield every item of a list endpoint, following `paging.cursors.after`."""
+        params = _query(**params)
+        while True:
+            page = await self.request("GET", path, params=params)
+            for item in page.get("data", []):
+                yield item
+            after = (page.get("paging") or {}).get("cursors", {}).get("after")
+            if not after or not (page.get("paging") or {}).get("next"):
+                return
+            params = {**params, "after": after}
 
     def _phone(self, phone_number_id: str | None) -> str:
         return phone_number_id or self.phone_number_id
@@ -149,18 +235,23 @@ class WhatsApp:
             json=payload, timeout=httpx.Timeout(15),
         )
 
-    async def _send_to(self, to: str, type_: str, content: dict, *, reply_to: str | None = None,
-                       phone_number_id: str | None = None) -> dict:
-        payload = {"messaging_product": "whatsapp", "recipient_type": "individual",
-                   "to": to, "type": type_, type_: content}
+    async def send(self, to: str, type_: str, content: dict | list, *,
+                   recipient_type: str = "individual", reply_to: str | None = None,
+                   callback_data: str | None = None, phone_number_id: str | None = None) -> dict:
+        """Send any message type: `content` is Meta's object for `type_`. `to` is a phone
+        number, a business-scoped user ID (BSUID), or a group ID with recipient_type="group"."""
+        payload = {"messaging_product": "whatsapp", "recipient_type": recipient_type,
+                   **_recipient(to), "type": type_, type_: content}
         if reply_to:
             payload["context"] = {"message_id": reply_to}
+        if callback_data:
+            payload["biz_opaque_callback_data"] = callback_data
         return await self.send_message(payload, phone_number_id=phone_number_id)
 
     async def send_text(self, to: str, body: str, *, preview_url: bool = False,
                         reply_to: str | None = None, phone_number_id: str | None = None) -> dict:
-        return await self._send_to(to, "text", {"body": body, "preview_url": preview_url},
-                                   reply_to=reply_to, phone_number_id=phone_number_id)
+        return await self.send(to, "text", {"body": body, "preview_url": preview_url},
+                               reply_to=reply_to, phone_number_id=phone_number_id)
 
     async def send_media(self, to: str, kind: str, *, media_id: str | None = None,
                          link: str | None = None, caption: str | None = None,
@@ -168,36 +259,33 @@ class WhatsApp:
                          phone_number_id: str | None = None) -> dict:
         """`kind` is image, video, audio, document, or sticker; give either `media_id` or `link`."""
         content = _clean({"id": media_id, "link": link, "caption": caption, "filename": filename})
-        return await self._send_to(to, kind, content, reply_to=reply_to,
-                                   phone_number_id=phone_number_id)
+        return await self.send(to, kind, content, reply_to=reply_to,
+                               phone_number_id=phone_number_id)
 
     async def send_location(self, to: str, latitude: float, longitude: float, *,
                             name: str | None = None, address: str | None = None,
                             reply_to: str | None = None, phone_number_id: str | None = None) -> dict:
         content = _clean({"latitude": latitude, "longitude": longitude, "name": name, "address": address})
-        return await self._send_to(to, "location", content, reply_to=reply_to,
-                                   phone_number_id=phone_number_id)
+        return await self.send(to, "location", content, reply_to=reply_to,
+                               phone_number_id=phone_number_id)
 
     async def send_contacts(self, to: str, contacts: list[dict], *, reply_to: str | None = None,
                             phone_number_id: str | None = None) -> dict:
-        payload = {"messaging_product": "whatsapp", "recipient_type": "individual",
-                   "to": to, "type": "contacts", "contacts": contacts}
-        if reply_to:
-            payload["context"] = {"message_id": reply_to}
-        return await self.send_message(payload, phone_number_id=phone_number_id)
+        return await self.send(to, "contacts", contacts, reply_to=reply_to,
+                               phone_number_id=phone_number_id)
 
     async def send_interactive(self, to: str, interactive: dict, *, reply_to: str | None = None,
                                phone_number_id: str | None = None) -> dict:
         """Buttons, lists, CTA URLs, flows, products, location requests: `interactive` is
         Meta's object as-is."""
-        return await self._send_to(to, "interactive", interactive, reply_to=reply_to,
-                                   phone_number_id=phone_number_id)
+        return await self.send(to, "interactive", interactive, reply_to=reply_to,
+                               phone_number_id=phone_number_id)
 
     async def send_reaction(self, to: str, message_id: str, emoji: str, *,
                             phone_number_id: str | None = None) -> dict:
         """An empty `emoji` removes the reaction."""
-        return await self._send_to(to, "reaction", {"message_id": message_id, "emoji": emoji},
-                                   phone_number_id=phone_number_id)
+        return await self.send(to, "reaction", {"message_id": message_id, "emoji": emoji},
+                               phone_number_id=phone_number_id)
 
     async def send_template_message(
         self,
@@ -219,7 +307,7 @@ class WhatsApp:
         payload: dict = {
             "messaging_product": "whatsapp",
             "recipient_type": "individual",
-            "to": to,
+            **_recipient(to),
             "type": "template",
             "template": template,
         }
@@ -244,9 +332,11 @@ class WhatsApp:
     # Media
 
     async def upload_message_media(
-        self, *, file_name: str, file_type: str, content: bytes, phone_number_id: str | None = None
+        self, *, file_name: str, file_type: str, content: bytes | BinaryIO,
+        phone_number_id: str | None = None,
     ) -> str:
-        """Upload send-time media and return its ID (templates use upload_template_sample)."""
+        """Upload send-time media (bytes or an open file) and return its ID; templates use
+        upload_template_sample."""
         response = await self.request(
             "POST", f"{self._phone(phone_number_id)}/media",
             data={"messaging_product": "whatsapp", "type": file_type},
@@ -327,11 +417,61 @@ class WhatsApp:
         # The upload edge wants the OAuth scheme, not Bearer.
         response = await self._send("POST", f"{self.base_url}/{upload_id}", auth="OAuth",
                                     headers={"file_offset": "0"}, content=content,
+                                    params=_query(appsecret_proof=self.appsecret_proof),
                                     timeout=httpx.Timeout(120.0))
         handle = _parse(response).get("h")
         if not handle:
             raise _error("Meta returned no media handle")
         return handle
+
+    async def list_template_library(self, **filters) -> dict:
+        """Meta's pre-written templates. `filters`: search, topic, usecase, industry, language,
+        name. Create one with create_message_template(library_template_name=...)."""
+        return await self.request("GET", "message_template_library", params=_query(**filters))
+
+    async def compare_templates(self, template_id: str, other_template_id: str, *, start: int,
+                                end: int) -> dict:
+        """Sends, block rate, and top block reason of two templates (7/30/60/90-day windows)."""
+        return await self.request("GET", f"{template_id}/compare", params=_query(
+            template_ids=[other_template_id], start=start, end=end))
+
+    async def preview_authentication_templates(self, *, languages: list[str] | None = None,
+                                               waba_id: str | None = None, **options) -> dict:
+        """`options`: add_security_recommendation, code_expiration_minutes, button_types."""
+        params = _query(category="AUTHENTICATION",
+                        languages=",".join(languages) if languages else None, **options)
+        return await self.request("GET", f"{self._waba(waba_id)}/message_template_previews",
+                                  params=params)
+
+    async def upsert_authentication_templates(self, *, name: str, languages: list[str],
+                                              components: list[dict],
+                                              waba_id: str | None = None, **extra) -> dict:
+        """Create or update one authentication template in many languages at once."""
+        return await self.request("POST", f"{self._waba(waba_id)}/upsert_message_templates", json=_clean({
+            "name": name, "languages": languages, "category": "AUTHENTICATION",
+            "components": components, **extra}))
+
+    async def migrate_message_templates(self, source_waba_id: str, *, page_number: int = 0,
+                                        count: int | None = None,
+                                        template_ids: list[str] | None = None,
+                                        waba_id: str | None = None) -> dict:
+        """Copy approved templates from another WABA of the same business into this one."""
+        return await self.request("POST", f"{self._waba(waba_id)}/migrate_message_templates", json=_clean({
+            "source_waba_id": source_waba_id, "page_number": page_number, "count": count,
+            "template_ids": template_ids}))
+
+    async def create_template_group(self, name: str, template_ids: list[str], *,
+                                    description: str | None = None,
+                                    waba_id: str | None = None) -> dict:
+        """Read, update, or delete a group with get_node / update_node / delete_node."""
+        return await self.request("POST", f"{self._waba(waba_id)}/template_groups", json=_clean({
+            "name": name, "description": description,
+            "whatsapp_business_templates": template_ids}))
+
+    async def list_template_groups(self, *, fields: str | None = None,
+                                   waba_id: str | None = None) -> dict:
+        return await self.request("GET", f"{self._waba(waba_id)}/template_groups",
+                                  params=_query(fields=fields))
 
     # Flows
 
@@ -514,6 +654,34 @@ class WhatsApp:
         return await self.request("POST", f"{self._phone(phone_number_id)}/conversational_automation",
                                   json=payload)
 
+    async def get_username(self, *, phone_number_id: str | None = None) -> dict:
+        """{username, status}; status is approved, reserved, ... ."""
+        return await self.request("GET", f"{self._phone(phone_number_id)}/username")
+
+    async def set_username(self, username: str, *, transfer_action: str | None = None,
+                           phone_number_id: str | None = None) -> dict:
+        return await self.request("POST", f"{self._phone(phone_number_id)}/username",
+                                  json=_clean({"username": username, "transfer_action": transfer_action}))
+
+    async def get_username_suggestions(self, *, phone_number_id: str | None = None) -> dict:
+        return await self.request("GET", f"{self._phone(phone_number_id)}/username_suggestions")
+
+    async def get_contact(self, bsuid: str, *, phone_number_id: str | None = None) -> dict:
+        """The contact book entry for a business-scoped user ID."""
+        return await self.request("GET", f"{self._phone(phone_number_id)}/contact_book",
+                                  params={"messaging_product": "whatsapp", "bsuid": bsuid})
+
+    async def delete_contact(self, bsuid: str, *, phone_number_id: str | None = None) -> dict:
+        return await self.request("DELETE", f"{self._phone(phone_number_id)}/contact_book",
+                                  params={"messaging_product": "whatsapp", "bsuid": bsuid})
+
+    async def sync_business_app_data(self, sync_type: str = "smb_app_state_sync", *,
+                                     phone_number_id: str | None = None) -> dict:
+        """Coexistence numbers: replay the WhatsApp Business app's contacts
+        (smb_app_state_sync) or chat history (history) as webhooks. Allowed once."""
+        return await self.request("POST", f"{self._phone(phone_number_id)}/smb_app_data",
+                                  json={"messaging_product": "whatsapp", "sync_type": sync_type})
+
     # QR codes
 
     async def list_qr_codes(self, *, code: str | None = None, fields: str | None = None,
@@ -593,7 +761,11 @@ class WhatsApp:
     async def delete_group(self, group_id: str) -> dict:
         return await self.request("DELETE", group_id)
 
+    async def get_group_invite_link(self, group_id: str) -> dict:
+        return await self.request("GET", f"{group_id}/invite_link")
+
     async def create_group_invite_link(self, group_id: str) -> dict:
+        """Creates the link, or resets it (old link stops working)."""
         return await self.request("POST", f"{group_id}/invite_link",
                                   json={"messaging_product": "whatsapp"})
 
@@ -635,12 +807,137 @@ class WhatsApp:
 
     async def get_analytics(self, metric: str, *, start: int, end: int, granularity: str,
                             waba_id: str | None = None, **filters) -> dict:
-        """`metric`: analytics, conversation_analytics, pricing_analytics, template_analytics,
-        template_group_analytics. `start`/`end` are UNIX seconds; `filters` (phone_numbers,
-        country_codes, metric_types, template_ids, dimensions, ...) follow Meta's names."""
+        """`metric`: analytics, conversation_analytics, pricing_analytics, call_analytics,
+        template_analytics, template_group_analytics, group_analytics. `start`/`end` are UNIX
+        seconds; `filters` (phone_numbers, country_codes, metric_types, template_ids,
+        group_ids, dimensions, ...) follow Meta's names."""
+        if metric in _ANALYTICS_EDGES:
+            return await self.request("GET", f"{self._waba(waba_id)}/{metric}", params=_query(
+                start=start, end=end, granularity=granularity, **filters))
         field = f"{metric}.start({start}).end({end}).granularity({granularity})"
         field += "".join(f".{k}({json.dumps(v)})" for k, v in _clean(filters).items())
         return await self.get_business_account(fields=field, waba_id=waba_id)
+
+    async def get_product_catalogs(self, *, waba_id: str | None = None) -> dict:
+        return await self.request("GET", f"{self._waba(waba_id)}/product_catalogs")
+
+    async def connect_product_catalog(self, catalog_id: str, *, waba_id: str | None = None) -> dict:
+        return await self.request("POST", f"{self._waba(waba_id)}/product_catalogs",
+                                  json={"catalog_id": catalog_id})
+
+    async def list_welcome_sequences(self, *, sequence_id: str | None = None,
+                                     waba_id: str | None = None) -> dict:
+        """Click-to-WhatsApp ad welcome messages."""
+        return await self.request("GET", f"{self._waba(waba_id)}/welcome_message_sequences",
+                                  params=_query(sequence_id=sequence_id))
+
+    async def save_welcome_sequence(self, name: str, sequence: dict, *,
+                                    sequence_id: str | None = None,
+                                    waba_id: str | None = None) -> dict:
+        """Create, or update when `sequence_id` is given. `sequence`: {text, autofill_message,
+        ice_breakers}."""
+        return await self.request("POST", f"{self._waba(waba_id)}/welcome_message_sequences",
+                                  data=_query(name=name, welcome_message_sequence=sequence,
+                                              sequence_id=sequence_id))
+
+    async def delete_welcome_sequence(self, sequence_id: str, *, waba_id: str | None = None) -> dict:
+        return await self.request("DELETE", f"{self._waba(waba_id)}/welcome_message_sequences",
+                                  params={"sequence_id": sequence_id})
+
+    async def create_signup(self, waba_id: str | None = None, **signup) -> dict:
+        """In-App Signup deep link: signup_message, confirmation_message, privacy_policy_url,
+        website_url, promo_code, display_name, policy."""
+        return await self.request("POST", f"{self._waba(waba_id)}/signups", json=_clean(signup))
+
+    async def list_signups(self, *, waba_id: str | None = None) -> dict:
+        return await self.request("GET", f"{self._waba(waba_id)}/signups")
+
+    async def get_signup(self, signup_id: str) -> dict:
+        return await self.request("GET", f"signups/{signup_id}")
+
+    async def update_signup(self, signup_id: str, **signup) -> dict:
+        return await self.request("POST", f"signups/{signup_id}", json=_clean(signup))
+
+    async def get_default_customer_base(self, *, waba_id: str | None = None) -> dict:
+        return await self.request("GET", f"{self._waba(waba_id)}/default_messaging_customer_base")
+
+    async def set_default_customer_base(self, customer_base_id: str, *,
+                                        waba_id: str | None = None) -> dict:
+        return await self.request("POST", f"{self._waba(waba_id)}/default_messaging_customer_base",
+                                  json={"messaging_customer_base_id": customer_base_id})
+
+    async def get_reach_estimate(self, targeting_spec: dict, *, date_interval: str | None = None,
+                                 waba_id: str | None = None) -> dict:
+        """Marketing messages audience size, e.g. {"geo_locations": {"countries": ["IN"]}}."""
+        return await self.request("GET", f"{self._waba(waba_id)}/reachestimate", params=_query(
+            targeting_spec=targeting_spec, date_interval=date_interval))
+
+    async def list_system_users(self, *, waba_id: str | None = None) -> dict:
+        return await self.request("GET", f"{self._waba(waba_id)}/system_users")
+
+    async def set_solution_migration_intent(self, solution_id: str, *,
+                                            waba_id: str | None = None) -> dict:
+        """Tag the WABA for migration to another Multi-Partner Solution."""
+        return await self.request("POST", f"{self._waba(waba_id)}/set_solution_migration_intent",
+                                  json={"solution_id": solution_id})
+
+    async def set_payment_method_migration_intent(self, *, currency: str | None = None,
+                                                  extended_credit_id: str | None = None,
+                                                  waba_id: str | None = None) -> dict:
+        """Change the WABA's billing currency or credit line; then `resume_migration`."""
+        return await self.request(
+            "POST", f"{self._waba(waba_id)}/set_payment_method_migration_intent",
+            json=_clean({"currency": currency, "extended_credit_id": extended_credit_id}))
+
+    async def resume_migration(self, migration_id: str) -> dict:
+        return await self.request("POST", f"{migration_id}/resume_migration")
+
+    # Payments (India: UPI and payment gateways)
+
+    async def list_payment_configurations(self, *, waba_id: str | None = None) -> dict:
+        return await self.request("GET", f"{self._waba(waba_id)}/payment_configurations")
+
+    async def get_payment_configuration(self, name: str, *, waba_id: str | None = None) -> dict:
+        return await self.request("GET", f"{self._waba(waba_id)}/payment_configuration/{name}")
+
+    async def create_payment_configuration(self, name: str, *, purpose_code: str,
+                                           merchant_category_code: str, provider_name: str,
+                                           waba_id: str | None = None, **extra) -> dict:
+        """`provider_name`: razorpay, payu, zaakpay, upi_vpa, ...; `extra`: redirect_url
+        (gateways) or merchant_vpa (UPI). Gateways answer with an OAuth link to finish."""
+        return await self.request("POST", f"{self._waba(waba_id)}/payment_configuration", json=_clean({
+            "configuration_name": name, "purpose_code": purpose_code,
+            "merchant_category_code": merchant_category_code, "provider_name": provider_name,
+            **extra}))
+
+    async def update_payment_configuration(self, name: str, *, waba_id: str | None = None,
+                                           **fields) -> dict:
+        """`fields`: data_endpoint_url, ... ."""
+        return await self.request("POST", f"{self._waba(waba_id)}/payment_configuration/{name}",
+                                  json=_clean(fields))
+
+    async def delete_payment_configuration(self, name: str, *, waba_id: str | None = None) -> dict:
+        return await self.request("DELETE", f"{self._waba(waba_id)}/payment_configuration",
+                                  json={"configuration_name": name})
+
+    async def regenerate_payment_oauth_link(self, name: str, redirect_url: str, *,
+                                            waba_id: str | None = None) -> dict:
+        return await self.request(
+            "POST", f"{self._waba(waba_id)}/generate_payment_configuration_oauth_link",
+            json={"configuration_name": name, "redirect_url": redirect_url})
+
+    async def get_payment(self, configuration_name: str, reference_id: str, *,
+                          phone_number_id: str | None = None) -> dict:
+        """Status of an order_details payment: pending or captured, plus transactions."""
+        return await self.request(
+            "GET", f"{self._phone(phone_number_id)}/payments/{configuration_name}/{reference_id}")
+
+    async def refund_payment(self, *, reference_id: str, payment_config_id: str, amount: dict,
+                             speed: str | None = None, phone_number_id: str | None = None) -> dict:
+        """`amount`: {currency, value, offset}; `speed`: instant or normal."""
+        return await self.request("POST", f"{self._phone(phone_number_id)}/payments_refund", json=_clean({
+            "reference_id": reference_id, "payment_config_id": payment_config_id,
+            "amount": amount, "speed": speed}))
 
     async def list_subscribed_apps(self, *, waba_id: str | None = None) -> dict:
         """Apps currently receiving webhooks for this WABA."""
@@ -686,10 +983,15 @@ class WhatsApp:
     async def list_waba_solutions(self, *, fields: str | None = None, waba_id: str | None = None) -> dict:
         return await self.request("GET", f"{self._waba(waba_id)}/solutions", params=_query(fields=fields))
 
+    async def debug_token(self, input_token: str | None = None) -> dict:
+        """App, expiry, scopes, and granular asset access of a token (default: this one)."""
+        payload = await self.request("GET", "debug_token",
+                                     params={"input_token": input_token or self.access_token})
+        return payload.get("data") or {}
+
     async def app_id(self) -> str:
         """The Meta app the access token belongs to."""
-        payload = await self.request("GET", "debug_token", params={"input_token": self.access_token})
-        app_id = (payload.get("data") or {}).get("app_id")
+        app_id = (await self.debug_token()).get("app_id")
         if not app_id:
             raise _error("Could not determine the Meta app for this token")
         return str(app_id)
@@ -735,11 +1037,79 @@ class WhatsApp:
         return await self.request("GET", f"{message_history_id}/events", params=_query(**filters))
 
     async def get_node(self, node_id: str, *, fields: str | None = None) -> dict:
-        """Any node by ID: account number, migration intent, bot, business profile, ... ."""
+        """Any node by ID: account number, migration intent, bot, business profile, template
+        group, credit allocation, ... ."""
         return await self.request("GET", node_id, params=_query(fields=fields))
 
     async def update_node(self, node_id: str, **body) -> dict:
         return await self.request("POST", node_id, json=_clean(body))
+
+    async def delete_node(self, node_id: str) -> dict:
+        """E.g. a template group, or a credit allocation (revokes a shared credit line)."""
+        return await self.request("DELETE", node_id)
+
+    async def get_system_user_token(self, business_id: str) -> str:
+        """Embedded Signup: the customer's business token, read with your system token.
+        Requires `app_secret` on the client."""
+        payload = await self.request("POST", f"{business_id}/system_user_access_tokens",
+                                     data={"fetch_only": "true"})
+        token = payload.get("access_token")
+        if not token:
+            raise _error("Meta returned no business token")
+        return token
+
+    async def list_business_users(self, business_id: str, *, fields: str | None = None) -> dict:
+        return await self.request("GET", f"{business_id}/business_users", params=_query(fields=fields))
+
+    async def list_app_details(self) -> dict:
+        """Apps a Tech Provider picked in the Multi-Partner Solution flow."""
+        return await self.request("GET", "me/application_details")
+
+    async def create_customer_base(self, business_id: str, name: str) -> dict:
+        return await self.request("POST", f"{business_id}/messaging_customer_base",
+                                  json={"messaging_customer_base_name": name})
+
+    async def list_customer_bases(self, business_id: str) -> dict:
+        return await self.request("GET", f"{business_id}/messaging_customer_base")
+
+    async def sign_max_price_agreement(self, business_id: str, *, signer_name: str,
+                                       signer_email: str) -> dict:
+        return await self.request("POST", f"{business_id}/max_price_agreements",
+                                  json={"signer_name": signer_name, "signer_email": signer_email})
+
+    async def submit_business_verification(self, business_id: str, end_business_id: str,
+                                           documents: list[tuple[str, bytes, str]]) -> dict:
+        """Partner-led verification; `documents` are (file_name, content, mime_type)."""
+        return await self.request(
+            "POST", f"{business_id}/self_certify_whatsapp_business",
+            data={"end_business_id": end_business_id},
+            files=[("business_documents[]", doc) for doc in documents])
+
+    async def list_business_verifications(self, business_id: str, *,
+                                          end_business_id: str | None = None) -> dict:
+        return await self.request(
+            "GET", f"{business_id}/self_certified_whatsapp_business_submissions",
+            params=_query(end_business_id=end_business_id))
+
+    # Credit lines
+
+    async def share_credit_line(self, credit_line_id: str, receiving_business_id: str) -> dict:
+        return await self.request("POST", f"{credit_line_id}/whatsapp_credit_sharing",
+                                  params={"receiving_business_id": receiving_business_id})
+
+    async def attach_credit_line(self, credit_line_id: str, waba_id: str, waba_currency: str, *,
+                                 share: bool = False) -> dict:
+        """`share` also shares the line with the WABA's business in the same call."""
+        edge = "whatsapp_credit_sharing_and_attach" if share else "whatsapp_credit_attach"
+        return await self.request("POST", f"{credit_line_id}/{edge}",
+                                  params={"waba_id": waba_id, "waba_currency": waba_currency})
+
+    async def list_credit_allocations(self, credit_line_id: str, receiving_business_id: str) -> dict:
+        """Revoke a share with delete_node(allocation_id)."""
+        return await self.request(
+            "GET", f"{credit_line_id}/owning_credit_allocation_configs",
+            params={"receiving_business_id": receiving_business_id,
+                    "fields": "id,receiving_business,request_status"})
 
     # Pre-verified phone numbers
 
@@ -748,6 +1118,11 @@ class WhatsApp:
 
     async def share_preverified_numbers(self, business_id: str, **body) -> dict:
         return await self.request("POST", f"{business_id}/share_preverified_numbers", json=_clean(body))
+
+    async def unshare_preverified_number(self, business_id: str, preverified_id: str,
+                                         partner_business_id: str) -> dict:
+        return await self.request("DELETE", f"{business_id}/share_preverified_numbers", params={
+            "partner_business_id": partner_business_id, "preverified_id": preverified_id})
 
     async def delete_preverified_number(self, preverified_id: str) -> dict:
         return await self.request("DELETE", preverified_id)
