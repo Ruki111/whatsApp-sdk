@@ -168,7 +168,12 @@ async def main() -> None:
             lambda request: httpx.Response(code, json={"error": error}))))
 
     assert (await error_of(status(429, {}))).retryable
-    assert (await error_of(status(503, {}))).retryable
+    assert (await error_of(status(500, {}))).retryable
+    gateway = await error_of(status(504, {}))
+    assert not gateway.retryable and gateway.maybe_sent
+    assert (await error_of(status(503, {}), "GET")).retryable
+    pooled = await error_of(failing(httpx.PoolTimeout("busy")))
+    assert pooled.retryable and not pooled.maybe_sent
     assert (await error_of(status(400, {"code": 130429}))).retryable
     assert (await error_of(status(400, {"code": 100, "is_transient": True}))).retryable
     assert not (await error_of(status(400, {"code": 131026}))).retryable
@@ -189,6 +194,10 @@ async def main() -> None:
     assert verify_signature("secret", b"{}", signature)
     assert not verify_signature("secret", b"{}", "sha256=bad")
     assert not verify_signature("secret", b"{}", None)
+    forged = "sha256=" + hmac.new(b"", b"{}", hashlib.sha256).hexdigest()
+    assert not verify_signature("", b"{}", forged)
+    assert not verify_signature("secret", b"{}", "sha256=\u00e9")
+    assert verify_challenge({"hub.mode": "subscribe", "hub.verify_token": "", "hub.challenge": "1"}, "") is None
 
     print("ok")
 

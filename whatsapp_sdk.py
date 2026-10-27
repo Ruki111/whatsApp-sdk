@@ -38,7 +38,7 @@ class WhatsAppError(Exception):
     """A non-2xx response, a 200 carrying an `error` object, or no response at all.
 
     `retryable`: sending the same request again is safe and may succeed (connection never
-    made, 429, 5xx, or a transient Meta code). `maybe_sent`: the request went out but no
+    made, 429, 5xx except a write's gateway error, or a transient Meta code). `maybe_sent`: the request went out but no
     answer came back, so a message may have been delivered; don't resend it blindly."""
 
     def __init__(self, status_code: int, payload: dict | None, *, retryable: bool | None = None,
@@ -76,12 +76,18 @@ class WhatsAppError(Exception):
 
 def verify_signature(app_secret: str, body: bytes, signature_header: str | None) -> bool:
     """Check a webhook's `X-Hub-Signature-256` header against the raw request body."""
+    # An empty secret would accept a signature anyone can compute.
+    if not app_secret or not signature_header:
+        return False
     expected = "sha256=" + hmac.new(app_secret.encode(), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature_header or "")
+    # Bytes: compare_digest raises TypeError on non-ASCII strings from the header.
+    return hmac.compare_digest(expected.encode(), signature_header.encode())
 
 
 def verify_challenge(params: dict, verify_token: str) -> str | None:
     """Webhook setup handshake: the `hub.challenge` to echo back, or None to reject (403)."""
+    if not verify_token:
+        return None
     token = str(params.get("hub.verify_token") or "")
     if params.get("hub.mode") == "subscribe" and hmac.compare_digest(
         token.encode(), verify_token.encode()
@@ -113,14 +119,15 @@ def _error(message: str) -> WhatsAppError:
 
 def _unreached(exc: httpx.HTTPError, method: str) -> WhatsAppError:
     message = f"Could not reach the Graph API: {exc}"
-    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+    # PoolTimeout: no connection was free, so nothing was sent.
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)):
         return WhatsAppError(502, {"error": {"message": message}}, retryable=True)
     # The request may have reached Meta: only reads are safe to repeat.
     return WhatsAppError(502, {"error": {"message": message}}, retryable=method == "GET",
                          maybe_sent=method != "GET")
 
 
-def _parse(response: httpx.Response) -> dict:
+def _parse(response: httpx.Response, method: str = "GET") -> dict:
     try:
         payload = response.json()
     except ValueError:
@@ -128,6 +135,9 @@ def _parse(response: httpx.Response) -> dict:
     # Non-object bodies (e.g. from a proxy) count as empty so they can't escape WhatsAppError.
     if not isinstance(payload, dict):
         payload = {}
+    if method != "GET" and response.status_code in (502, 503, 504):
+        # A gateway error can arrive after Meta already acted on the request.
+        raise WhatsAppError(response.status_code, payload, retryable=False, maybe_sent=True)
     if response.status_code >= 400 or "error" in payload:
         raise WhatsAppError(response.status_code, payload)
     return payload
@@ -210,7 +220,7 @@ class WhatsApp:
         if self.appsecret_proof:
             params = {**(params or {}), "appsecret_proof": self.appsecret_proof}
         return _parse(await self._send(method, f"{self.base_url}/{path}", timeout=timeout,
-                                       params=params, **kwargs))
+                                       params=params, **kwargs), method)
 
     async def paginate(self, path: str, **params) -> AsyncIterator[dict]:
         """Yield every item of a list endpoint, following `paging.cursors.after`."""
@@ -456,7 +466,7 @@ class WhatsApp:
                                     headers={"file_offset": "0"}, content=content,
                                     params=_query(appsecret_proof=self.appsecret_proof),
                                     timeout=httpx.Timeout(120.0))
-        handle = _parse(response).get("h")
+        handle = _parse(response, "POST").get("h")
         if not handle:
             raise _error("Meta returned no media handle")
         return handle
