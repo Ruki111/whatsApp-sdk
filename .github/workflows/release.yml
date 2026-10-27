@@ -22,8 +22,8 @@ jobs:
 
       - name: Test
         run: |
-          uv run --no-project --python 3.10 --with httpx python test_whatsapp_sdk.py
-          uv run --no-project --python 3.13 --with httpx python test_whatsapp_sdk.py
+          uv run --isolated --no-project --python 3.10 --with . python tests/test_whatsapp_sdk.py
+          uv run --isolated --no-project --python 3.13 --with . python tests/test_whatsapp_sdk.py
 
       - name: Build
         run: uv build

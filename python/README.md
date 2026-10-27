@@ -60,7 +60,21 @@ Anything not wrapped: `await wa.request("GET", "<path>", params=..., json=...)`.
 
 Reference: https://developers.facebook.com/documentation/business-messaging/whatsapp/reference/llms.txt
 
-Test (from `python/`): `uv run --no-project --with httpx python test_whatsapp_sdk.py`
+## Layout
+
+```
+src/whatsapp_sdk/
+├── __init__.py   public exports
+├── client.py     WhatsApp (combines the three API areas) and exchange_code
+├── _base.py      request plumbing: auth, appsecret_proof, pagination, media streaming
+├── messages.py   messages, media, templates, Flows
+├── account.py    phone numbers, profile, QR codes, blocking, calling, groups
+├── business.py   business account, analytics, payments, partners, credit lines
+├── errors.py     WhatsAppError and retry classification
+└── webhooks.py   verify_signature, verify_challenge
+```
+
+Test (from `python/`): `uv run --isolated --no-project --with . python tests/test_whatsapp_sdk.py`
 
 ## License
 
