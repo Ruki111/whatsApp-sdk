@@ -9,6 +9,7 @@ import hmac
 import json
 from collections.abc import AsyncIterator
 from typing import BinaryIO
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -22,6 +23,9 @@ GRAPH_URL = "https://graph.facebook.com"
 # Meta error codes that clear up on their own (outage, rate and throughput limits, template
 # still syncing); see https://developers.facebook.com/documentation/business-messaging/whatsapp/support/error-codes
 RETRYABLE_CODES = frozenset({2, 4, 80007, 130429, 131000, 131016, 131056, 133004, 134101})
+
+# Media download URLs live on these hosts; the access token is never sent anywhere else.
+MEDIA_HOSTS = (".fbsbx.com", ".facebook.com", ".whatsapp.net")
 
 # Include review details and components so sync can report rejections and detect external edits.
 TEMPLATE_FIELDS = (
@@ -351,14 +355,47 @@ class WhatsApp:
         """{url, mime_type, sha256, file_size, id}; the url expires after 5 minutes."""
         return await self.request("GET", media_id, params=_query(phone_number_id=phone_number_id))
 
-    async def download_media(self, media_id: str, *, phone_number_id: str | None = None) -> bytes:
+    async def iter_media(self, url: str, *, max_bytes: int | None = None,
+                         chunk_size: int = 65536) -> AsyncIterator[bytes]:
+        """Stream a media URL from get_media in chunks. The token is only ever sent to Meta's
+        own HTTPS hosts, redirects are refused, and `max_bytes` stops oversized files."""
+        parts = urlsplit(url)
+        if (parts.scheme != "https" or not parts.hostname or parts.username or parts.password
+                or parts.port not in (None, 443) or not parts.hostname.endswith(MEDIA_HOSTS)):
+            raise _error("Untrusted media URL")
+        client = self.client or httpx.AsyncClient()
+        try:
+            async with client.stream(
+                "GET", url, headers={"Authorization": f"Bearer {self.access_token}"},
+                timeout=httpx.Timeout(120.0, connect=10.0), follow_redirects=False,
+            ) as response:
+                if response.is_redirect:
+                    raise _error("Media redirects are not followed")
+                if response.status_code >= 400:
+                    await response.aread()
+                    _parse(response)
+                length = response.headers.get("content-length")
+                if max_bytes is not None and length and length.isdigit() and int(length) > max_bytes:
+                    raise _error("Media exceeds the size limit")
+                size = 0
+                async for chunk in response.aiter_bytes(chunk_size):
+                    size += len(chunk)
+                    if max_bytes is not None and size > max_bytes:
+                        raise _error("Media exceeds the size limit")
+                    yield chunk
+        except httpx.HTTPError as exc:
+            raise _unreached(exc, "GET") from exc
+        finally:
+            if client is not self.client:
+                await client.aclose()
+
+    async def download_media(self, media_id: str, *, max_bytes: int | None = None,
+                             phone_number_id: str | None = None) -> bytes:
+        """Whole file in memory; use get_media + iter_media to stream large files to disk."""
         url = (await self.get_media(media_id, phone_number_id=phone_number_id)).get("url")
         if not url:
             raise _error("Meta returned no media URL")
-        response = await self._send("GET", url, timeout=httpx.Timeout(120.0))
-        if response.status_code >= 400:
-            _parse(response)
-        return response.content
+        return b"".join([chunk async for chunk in self.iter_media(str(url), max_bytes=max_bytes)])
 
     async def delete_media(self, media_id: str, *, phone_number_id: str | None = None) -> dict:
         return await self.request("DELETE", media_id, params=_query(phone_number_id=phone_number_id))
@@ -475,8 +512,10 @@ class WhatsApp:
 
     # Flows
 
-    async def list_flows(self, *, fields: str | None = None, waba_id: str | None = None) -> dict:
-        return await self.request("GET", f"{self._waba(waba_id)}/flows", params=_query(fields=fields))
+    async def list_flows(self, *, fields: str | None = None, limit: int | None = None,
+                         after: str | None = None, waba_id: str | None = None) -> dict:
+        return await self.request("GET", f"{self._waba(waba_id)}/flows",
+                                  params=_page(fields, limit, after))
 
     async def create_flow(self, *, name: str, categories: list[str], flow_json: str | None = None,
                           publish: bool | None = None, clone_flow_id: str | None = None,
@@ -818,8 +857,18 @@ class WhatsApp:
         field += "".join(f".{k}({json.dumps(v)})" for k, v in _clean(filters).items())
         return await self.get_business_account(fields=field, waba_id=waba_id)
 
-    async def get_product_catalogs(self, *, waba_id: str | None = None) -> dict:
-        return await self.request("GET", f"{self._waba(waba_id)}/product_catalogs")
+    async def get_product_catalogs(self, *, fields: str | None = None,
+                                   waba_id: str | None = None) -> dict:
+        """The catalog connected to the WABA, e.g. fields="id,name,product_count"."""
+        return await self.request("GET", f"{self._waba(waba_id)}/product_catalogs",
+                                  params=_query(fields=fields))
+
+    async def list_catalog_products(self, catalog_id: str, *, fields: str | None = None,
+                                    limit: int | None = None, after: str | None = None,
+                                    filter: dict | None = None) -> dict:
+        """`filter` is Meta's product filter, e.g. {"name": {"i_contains": "shoe"}}."""
+        return await self.request("GET", f"{catalog_id}/products",
+                                  params=_page(fields, limit, after, filter=filter))
 
     async def connect_product_catalog(self, catalog_id: str, *, waba_id: str | None = None) -> dict:
         return await self.request("POST", f"{self._waba(waba_id)}/product_catalogs",

@@ -76,6 +76,29 @@ async def main() -> None:
         assert await wa.download_media("m1") == b"bytes"
         assert seen[-1].headers["authorization"] == "Bearer tok"
 
+        # The token never leaves Meta's hosts, and oversized files stop mid-stream.
+        for url in ("https://evil.example/f", "http://lookaside.fbsbx.com/f",
+                    "https://lookaside.fbsbx.com:8443/f", "https://evilfbsbx.com/f"):
+            count = len(seen)
+            try:
+                [c async for c in wa.iter_media(url)]
+            except WhatsAppError as error:
+                assert "Untrusted" in error.message and len(seen) == count
+            else:
+                raise AssertionError(f"{url} was fetched")
+        try:
+            await wa.download_media("m1", max_bytes=3)
+        except WhatsAppError as error:
+            assert "size limit" in error.message
+        else:
+            raise AssertionError("max_bytes not enforced")
+
+        await wa.list_catalog_products("c1", fields="name", limit=100, filter={"name": {"i_contains": "x"}})
+        assert seen[-1].url.path == "/v99.0/c1/products"
+        assert json.loads(seen[-1].url.params["filter"]) == {"name": {"i_contains": "x"}}
+        await wa.list_flows(fields="id,name", limit=100)
+        assert seen[-1].url.params["limit"] == "100"
+
         assert await wa.upload_template_sample(file_name="a.png", file_type="image/png", content=b"x") == "handle"
         assert seen[-1].headers["authorization"] == "OAuth tok"
 
@@ -152,6 +175,15 @@ async def main() -> None:
 
     assert verify_challenge({"hub.mode": "subscribe", "hub.verify_token": "v", "hub.challenge": "42"}, "v") == "42"
     assert verify_challenge({"hub.mode": "subscribe", "hub.verify_token": "x", "hub.challenge": "42"}, "v") is None
+
+    redirecting = WhatsApp("tok", client=httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(302, headers={"location": "https://evil.example/"}))))
+    try:
+        [c async for c in redirecting.iter_media("https://lookaside.fbsbx.com/f")]
+    except WhatsAppError as error:
+        assert "redirect" in error.message
+    else:
+        raise AssertionError("redirect followed")
 
     signature = "sha256=" + hmac.new(b"secret", b"{}", hashlib.sha256).hexdigest()
     assert verify_signature("secret", b"{}", signature)

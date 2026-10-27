@@ -43,7 +43,7 @@ Anything not wrapped: `await wa.request("GET", "<path>", params=..., json=...)`.
 | Area | Methods |
 | --- | --- |
 | Messages | `send` (any type, BSUID, groups), `send_message` (raw payload), `send_text`, `send_media`, `send_location`, `send_contacts`, `send_interactive`, `send_reaction`, `send_template_message` (incl. MM Lite), `mark_message_read` (+ typing indicator) |
-| Media | `upload_message_media` (bytes or file), `get_media`, `download_media`, `delete_media` |
+| Media | `upload_message_media` (bytes or file), `get_media`, `iter_media` (streamed, Meta hosts only, no redirects, `max_bytes`), `download_media`, `delete_media` |
 | Templates | create, update, get, list, delete (bulk), `upload_template_sample`, `list_template_library`, `compare_templates`, `preview_authentication_templates`, `upsert_authentication_templates`, `migrate_message_templates`, template groups |
 | Flows | `list_flows`, `create_flow`, `get_flow` (+ metrics, preview), `update_flow`, `delete_flow`, `upload_flow_json`, `list_flow_assets`, `publish_flow`, `deprecate_flow`, `migrate_flows` |
 | Phone numbers | list, create, get, update, `set_two_step_pin`, register, deregister, request/verify code, `get_sending_limits`, settings, username (+ suggestions), contact book (BSUID), `sync_business_app_data` (coexistence) |
@@ -51,7 +51,7 @@ Anything not wrapped: `await wa.request("GET", "<path>", params=..., json=...)`.
 | QR codes · Blocking | `list/get/create/delete_qr_code(s)` · `list_blocked_users`, `block_users`, `unblock_users` |
 | Calling | `call` (connect, pre_accept, accept, reject, terminate, media_update), `get_call_permissions` |
 | Groups | create, list, get, update, delete, invite link (get/reset/delete), join requests, participants |
-| WABA | get/update, `get_analytics` (messaging, conversation, pricing, call, template, template group, group), subscribed apps (+ callback override), assigned users, system users, schedules, activities, solutions, product catalogs, CTWA welcome sequences, In-App Signup, customer bases, reach estimate, migrations |
+| WABA | get/update, `get_analytics` (messaging, conversation, pricing, call, template, template group, group), subscribed apps (+ callback override), assigned users, system users, schedules, activities, solutions, product catalogs (+ `list_catalog_products`), CTWA welcome sequences, In-App Signup, customer bases, reach estimate, migrations |
 | Payments (India) | payment configurations (list/get/create/update/delete, OAuth link), `get_payment`, `refund_payment` |
 | Partners | business portfolio, owned/client WABAs, create WABA, add phone numbers, business users, extended credit lines (share/attach/revoke), MM Lite onboarding, max price agreement, partner-led business verification, pre-verified numbers, Multi-Partner Solutions, message history events |
 | Auth & tokens | `exchange_code` (Embedded Signup), `get_system_user_token`, `debug_token`, `app_id`, `appsecret_proof` |
