@@ -1,10 +1,10 @@
-# whatsapp-sdk
+# openping-whatsapp
 
 Async Python client for the WhatsApp Business Platform (Meta Graph API, default `v26.0`).
 One file, one dependency (`httpx`).
 
 ```bash
-uv add "whatsapp-sdk @ git+https://github.com/Ruki111/whatsApp-sdk"
+pip install openping-whatsapp      # or: uv add openping-whatsapp
 ```
 
 ```python
@@ -61,3 +61,12 @@ Anything not wrapped: `await wa.request("GET", "<path>", params=..., json=...)`.
 Reference: https://developers.facebook.com/documentation/business-messaging/whatsapp/reference/llms.txt
 
 Test: `uv run --no-project --with httpx python test_whatsapp_sdk.py`
+
+## Releasing
+
+1. Bump `version` in `pyproject.toml` and push to `main`.
+2. Actions → **Release to PyPI & GitHub** → Run workflow. It tests, builds, publishes to PyPI, tags `vX.Y.Z`, and creates a GitHub release.
+
+## License
+
+Apache-2.0

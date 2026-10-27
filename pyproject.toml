@@ -1,14 +1,33 @@
 [project]
-name = "whatsapp-sdk"
+name = "openping-whatsapp"
 version = "0.1.0"
-description = "Async client for the WhatsApp Cloud API"
+description = "Async Python client for the WhatsApp Business Platform (Meta Cloud API)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["httpx>=0.28.0"]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "OpenPing" }]
+keywords = ["whatsapp", "whatsapp-cloud-api", "meta", "graph-api", "async"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Communications :: Chat",
+]
+
+[project.urls]
+Repository = "https://github.com/Ruki111/whatsApp-sdk"
+Issues = "https://github.com/Ruki111/whatsApp-sdk/issues"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 only-include = ["whatsapp_sdk.py"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["whatsapp_sdk.py", "test_whatsapp_sdk.py", "README.md", "LICENSE"]
