@@ -1,0 +1,24 @@
+[package]
+name = "openping-whatsapp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Async Rust client for the WhatsApp Business Platform (Meta Cloud API)"
+license = "Apache-2.0"
+repository = "https://github.com/Ruki111/whatsApp-sdk"
+keywords = ["whatsapp", "meta", "graph-api", "async"]
+categories = ["api-bindings", "asynchronous"]
+publish = false  # not released yet; the Python package is the published one
+
+[dependencies]
+bytes = "1"
+hmac = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+hmac = "0.12"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+wiremock = "0.6"
