@@ -163,10 +163,11 @@ class _Base:
         if not upload_id:
             raise _error("Upload session was not opened")
         # The upload edge wants the OAuth scheme, not Bearer.
-        response = await self._send("POST", f"{self.base_url}/{upload_id}", auth="OAuth",
-                                    headers={"file_offset": "0"}, content=content,
-                                    params=_query(appsecret_proof=self.appsecret_proof),
-                                    timeout=httpx.Timeout(120.0))
+        # The id carries a signed ?sig=; httpx's params= would replace that query, so merge instead.
+        url = httpx.URL(f"{self.base_url}/{upload_id}").copy_merge_params(
+            _query(appsecret_proof=self.appsecret_proof))
+        response = await self._send("POST", str(url), auth="OAuth", headers={"file_offset": "0"},
+                                    content=content, timeout=httpx.Timeout(120.0))
         handle = _parse(response, "POST").get("h")
         if not handle:
             raise _error("Meta returned no media handle")

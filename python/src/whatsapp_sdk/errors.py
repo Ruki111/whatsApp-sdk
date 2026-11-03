@@ -32,6 +32,7 @@ class WhatsAppError(Exception):
         self.message = (
             error.get("error_user_msg")
             or error.get("message")
+            or (self.payload.get("debug_info") or {}).get("message")  # the upload edge's shape
             or "WhatsApp Cloud API request failed"
         )
         super().__init__(self.message)

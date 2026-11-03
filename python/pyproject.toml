@@ -1,6 +1,6 @@
 [project]
 name = "openping-whatsapp"
-version = "0.2.0"
+version = "0.2.1"
 description = "Async Python client for the WhatsApp Business Platform (Meta Cloud API)"
 readme = "README.md"
 requires-python = ">=3.10"
