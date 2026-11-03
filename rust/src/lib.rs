@@ -74,6 +74,10 @@ impl Error {
             // error_user_msg is the human-readable one; `message` is the generic fallback.
             message: text("error_user_msg")
                 .or_else(|| text("message"))
+                .or_else(|| {
+                    // The upload edge's error shape.
+                    payload.pointer("/debug_info/message").and_then(Value::as_str).map(str::to_owned)
+                })
                 .unwrap_or_else(|| "WhatsApp Cloud API request failed".into()),
             retryable,
             maybe_sent,

@@ -27,7 +27,7 @@ async def main() -> None:
         if path.endswith("/debug_token"):
             return httpx.Response(200, json={"data": {"app_id": "app1"}})
         if path.endswith("/uploads"):
-            return httpx.Response(200, json={"id": "upload:1"})
+            return httpx.Response(200, json={"id": "upload:1?sig=abc"})
         if path.endswith("/upload:1"):
             return httpx.Response(200, json={"h": "handle"})
         return httpx.Response(200, json={"success": True})
@@ -101,6 +101,8 @@ async def main() -> None:
 
         assert await wa.upload_template_sample(file_name="a.png", file_type="image/png", content=b"x") == "handle"
         assert seen[-1].headers["authorization"] == "OAuth tok"
+        assert seen[-1].url.params["sig"] == "abc"
+        assert WhatsAppError(400, {"debug_info": {"message": "HMAC check failed"}}).message == "HMAC check failed"
 
         await wa.subscribe_app_to_waba()
         assert seen[-1].content == b""
